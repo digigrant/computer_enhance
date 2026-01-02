@@ -1,5 +1,5 @@
 #import "Compiler";
-#import "Basic";   // we overwrite print to print bytes...!
+#import "Basic";
 #import "File";
 #import "String";
 
@@ -65,6 +65,22 @@ BytePrinter :: (builder: *String_Builder, any: Any, struct_printer_data: *void) 
                 return true;
             }
         }
+        case .STRUCT; {
+            ti_struct := cast(*Type_Info_Struct) any.type;
+            if ti_struct.name == {
+                case "InstructionBuffer"; {
+                    instruction_buffer := cast(*InstructionBuffer) any.value_pointer;
+                    using instruction_buffer.*;
+                    append(builder, sprint("{% bytes: [", num_bytes));
+                    for 0..5 {
+                        if it > 0 append(builder, " ");
+                        append(builder, ifx it < num_bytes sprint("%", buffer[it]) else "--------");
+                    }
+                    append(builder, sprint("]}",));
+                    return true;
+                }
+            }
+        }
     }
 
     return false;
@@ -86,7 +102,9 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
     // we know 6 bytes will contain every possible instruction, so...
     using instruction : InstructionBuffer;
 
-    asm : String_Builder;
+    full_asm : String_Builder;  // full string to return including comments
+    asm : String_Builder;       // string containing only asm code
+    init_string_builder(*full_asm, 256);
     init_string_builder(*asm, 64);
     printed_to_asm := false;
 
@@ -99,7 +117,7 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
 
         case 0b1000; {
             if buffer[0] >> 2 == 0b100010 { // MOV (R/M to/from register)
-                append(*asm, "; MOV (R/M to/from register)\n");
+                append(*full_asm, "; MOV (R/M to/from register)\n");
 
                 // read at least 1 more byte to know mode value
                 ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 1);
@@ -174,7 +192,7 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
             REG_MASK    :: 0b00000111;
             word_flag := buffer[0] & WORD_MASK;
 
-            append(*asm, sprint("; MOV (immediate to register - %)\n", ifx word_flag then "16 bits" else "8 bits"));
+            append(*full_asm, sprint("; MOV (immediate to register - %)\n", ifx word_flag then "16 bits" else "8 bits"));
 
             // read 1 or 2 more bytes depending on w
             ReadBytesIntoInstructionBuffer(file, cursor, *instruction, xx ifx word_flag then 2 else 1);
@@ -189,10 +207,10 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
 
     }
 
-    if !printed_to_asm append(*asm, "Unknown instruction code.\n");
-    if print_instruction_buffer append(*asm, sprint("; instruction_buffer: %\n", instruction));
+    if print_instruction_buffer append(*full_asm, sprint("; instruction_buffer: %\n", instruction));
+    append(*full_asm, ifx printed_to_asm builder_to_string(*asm) else "Unknown instruction code.\n");
 
-    return builder_to_string(*asm);
+    return builder_to_string(*full_asm);
 }
 
 #run {
