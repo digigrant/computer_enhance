@@ -1,5 +1,5 @@
 #import "Compiler";
-#import "Basic";
+#import "Basic";   // we overwrite print to print bytes...!
 #import "File";
 #import "String";
 
@@ -8,6 +8,7 @@ REGISTER_NAME : [NUM_REGISTERS] string : #run BuildRegisterNames();
 
 BuildRegisterNames :: () -> [NUM_REGISTERS] string {
     register_names : [NUM_REGISTERS] string;
+
     // 8 bit
     register_names[0b0000] = "al";
     register_names[0b0001] = "cl";
@@ -27,6 +28,7 @@ BuildRegisterNames :: () -> [NUM_REGISTERS] string {
     register_names[0b1101] = "bp";
     register_names[0b1110] = "si";
     register_names[0b1111] = "di";
+
     return register_names;
 }
 
@@ -48,8 +50,24 @@ BuildEffectiveAddresses :: () -> [NUM_EFFECTIVE_ADDRESSES] string {
 
 MAX_INSTRUCTION_BYTES :: 6;
 InstructionBuffer :: struct {
-    buffer : [MAX_INSTRUCTION_BYTES] u8;
+    buffer : [MAX_INSTRUCTION_BYTES] byte;
     num_bytes : u8;
+}
+
+byte :: #type,isa u8;
+
+BytePrinter :: (builder: *String_Builder, any: Any, struct_printer_data: *void) -> bool {
+    if any.type.type == {
+        case .VARIANT; {
+            ti_variant := cast(*Type_Info_Variant) any.type;
+            if ti_variant.name == "byte" {
+                print_integer(builder, .{value=any, base=2, minimum_digits=8});
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 ReadBytesIntoInstructionBuffer :: (file : string, cursor : *int, inst : *InstructionBuffer, count : u8) {
@@ -63,13 +81,14 @@ ReadBytesIntoInstructionBuffer :: (file : string, cursor : *int, inst : *Instruc
     num_bytes += count;
 }
 
-ReadInstruction :: (file : string, cursor : *int) -> asm : string {
+ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : bool = false) -> asm : string {
     // inst : u16; // this needs to change - read 8 bits first, determine if we need more
     // we know 6 bytes will contain every possible instruction, so...
     using instruction : InstructionBuffer;
 
     asm : String_Builder;
     init_string_builder(*asm, 64);
+    printed_to_asm := false;
 
     // read first byte
     ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 1);
@@ -102,18 +121,19 @@ ReadInstruction :: (file : string, cursor : *int) -> asm : string {
 
                 dest, source : string; // ultimately we need to figure these out
 
+                // helper function -> "[base (+ displacement)]"
                 FormatEffectiveAddress :: (base : string, displacement : u16 = 0) -> string {
                     return sprint("[%]", ifx displacement != 0 then sprint("% + %", base, displacement) else base);
                 }
 
-                // figure out if we need to read displacement bytes
-                // get source and dest
+                // read any more displacement bytes we might need to
+                // get (formatted) source and dest
                 if mode == {
                     case 0b00; { // Memory Mode - no displacement* (still must read 1 byte if R/M = 110)
                         base_effective_address : string;
                         if r_m == 0b110 {
                             ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 2);
-                            base_effective_address = sprint("%", buffer[2]); // not sure how to directly cast u16 to string. too tired to figure it out
+                            base_effective_address = sprint("%", cast(u8) buffer[2]); // not sure how to directly cast u16 to string. too tired to figure it out
                         } else {
                             base_effective_address = EFFECTIVE_ADDRESS[r_m];
                         }
@@ -144,7 +164,8 @@ ReadInstruction :: (file : string, cursor : *int) -> asm : string {
                     }
                 }
 
-                append(*asm, sprint("mov %, %", dest, source));
+                append(*asm, sprint("mov %, %\n", dest, source));
+                printed_to_asm = true;
             }
         }
 
@@ -159,30 +180,38 @@ ReadInstruction :: (file : string, cursor : *int) -> asm : string {
             ReadBytesIntoInstructionBuffer(file, cursor, *instruction, xx ifx word_flag then 2 else 1);
 
             // do shit
-            append(*asm, sprint("mov %, %",
+            append(*asm, sprint("mov %, %\n",
                 REGISTER_NAME[buffer[0] & (WORD_MASK | REG_MASK)],
                 (cast(*u16) *(buffer[1])).*)
             );
+            printed_to_asm = true;
         }
 
     }
-    
+
+    if !printed_to_asm append(*asm, "Unknown instruction code.\n");
+    if print_instruction_buffer append(*asm, sprint("; instruction_buffer: %\n", instruction));
+
     return builder_to_string(*asm);
 }
 
 #run {
     set_build_options_dc(.{do_output=false});
-    //context.print_style.default_format_int.base = 2; // print ints in binary
+    context.print_style.struct_printer = BytePrinter;
 
     options := get_build_options();
     args := options.compile_time_command_line;
 
-    if (args.count != 1) {
+    if (args.count < 1) {
         print("Incorrect number of arguments. Expected:\n");
         print("\tjai 8086_inst_decoder.jai - <input_filename>\n");
+        print("Optional arguments:\n");
+        print("\tprint_instruction_buffer - prints instruction buffer when processing an instruction\n");
         print("Exiting.\n");
         return;
     }
+
+    print_instruction_buffer : bool = array_find(args, "print_instruction_buffer");
 
     file, ok := read_entire_file(args[0]);
     if !ok {
@@ -195,11 +224,11 @@ ReadInstruction :: (file : string, cursor : *int) -> asm : string {
 
     filename := ifx begins_with(args[0], "./") then slice(args[0], 2, args[0].count-2) else args[0];
     append(*asm, sprint("; %\n", filename));
-    append(*asm, "bits 16\n");
+    append(*asm, "bits 16\n\n");
 
     cursor := 0;
     while cursor < file.count {
-        append(*asm, sprint("%\n", ReadInstruction(file, *cursor)));
+        append(*asm, sprint("%\n", ReadInstruction(file, *cursor, print_instruction_buffer=print_instruction_buffer)));
     }
 
     print("%\n", builder_to_string(*asm));
