@@ -49,18 +49,20 @@ BuildEffectiveAddresses :: () -> [NUM_EFFECTIVE_ADDRESSES] string {
     return effective_addresses;
 }
 
-/*
-GetNumDisplacementBytesToRead :: (mode : u8, r_m : u8) -> u8 {
-    num : u8;
-    if mode == {
-        case 0b00; num = xx ifx r_m == 0b110 then 2 else 0;
-        case 0b01; num = 1;
-        case 0b10; num = 2;
-        case 0b11; num = 0;
-    }
-    return num;
+NUM_MATH_OPERATIONS :: 8;
+MATH_OPERATION : [NUM_MATH_OPERATIONS] string : #run BuildMathOperations();
+BuildMathOperations :: () -> [NUM_MATH_OPERATIONS] string {
+    math_operations : [NUM_MATH_OPERATIONS] string;
+    math_operations[0b000] = "add";
+    math_operations[0b001] = "or";
+    math_operations[0b010] = "adc";
+    math_operations[0b011] = "sbb";
+    math_operations[0b100] = "and";
+    math_operations[0b101] = "sub";
+    math_operations[0b110] = "xor";
+    math_operations[0b111] = "cmp";
+    return math_operations;
 }
-*/
 
 ReadDisplacementBytesAndGetDisplacement :: (file : string, cursor : *int, instruction : *InstructionBuffer, mode : u8, r_m : u8) -> s16 {
     num_displacement_bytes : u8 = 0;
@@ -97,6 +99,7 @@ GetEffectiveAddressString :: (mode : u8, r_m : u8, displacement : s16 = 0) -> st
     if displacement != 0
         append(*effective_address, sprint(" % %", ifx displacement > 0 "+" else "-", abs(displacement)));
     append(*effective_address, "]");
+
     return builder_to_string(*effective_address);
 }
 
@@ -150,12 +153,11 @@ ReadBytesIntoInstructionBuffer :: (file : string, cursor : *int, inst : *Instruc
 }
 
 ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : bool = false) -> asm : string {
-    // inst : u16; // this needs to change - read 8 bits first, determine if we need more
-    // we know 6 bytes will contain every possible instruction, so...
     using instruction : InstructionBuffer;
 
     full_asm : String_Builder;  // full string to return including comments
     asm : String_Builder;       // string containing only asm code
+
     init_string_builder(*full_asm, 256);
     init_string_builder(*asm, 64);
     printed_to_asm := false;
@@ -166,11 +168,55 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
     // determine what opcode we are doing and whether we need to read more bytes
     // the first 4 bits give us a clue if we need to read more
 
+    if buffer[0] >> 6 == {
+        case 0b00; { // math operation
+            MATH_OPERATION_MASK :: 0b00111000;
+            TO_ACC_MASK         :: 0b00000100;
+            DIR_MASK            :: 0b00000010;
+            WORD_MASK           :: 0b00000001;
+
+            math_operation := MATH_OPERATION[(buffer[0] & MATH_OPCODE_MASK) >> 3];
+
+            to_acc : u8 = (buffer[0] & TO_ACC_MASK) >> 2;
+            dir : u8 = ifx to_acc then 0 else (buffer[0] & DIR_MASK) >> 1;  // dir always = 0 if to_acc
+            word : u8 = buffer[0] & WORD_MASK;
+
+            if !to_acc {
+                ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 1);
+
+                MODE_MASK   :: 0b11000000;
+                REG_MASK    :: 0b00111000;
+                R_M_MASK    :: 0b00000111;
+
+                mode := (buffer[1] & MODE_MASK) >> 6;
+                reg := (buffer[1] & REG_MASK) >> 3;
+                r_m := buffer[1] & R_M_MASK;
+
+                if mode == {
+                    case 0b00; #through
+                    case 0b01; #through
+                    case 0b10; {
+
+                    }
+                    case 0b11; {
+                        
+                    }
+                }
+
+                displacement := ReadDisplacementBytesAndGetDisplacement(file, cursor, *instruction, mode, r_m);
+
+            } else {
+
+            }
+
+        }
+    }
+
     if buffer[0] >> 4 == { // high nibble
 
         case 0b1000; {
             if buffer[0] >> 2 == 0b100010 { // MOV (R/M to/from register)
-                append(*full_asm, "; MOV (R/M to/from register)\n");
+                append(*full_asm, "; MOV (R/M to or from register)\n");
 
                 // read at least 1 more byte to know mode value
                 ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 1);
@@ -192,15 +238,18 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
 
                 dest, source : string; // ultimately we need to figure these out
 
-                // get displacement if one exists
-                displacement := ReadDisplacementBytesAndGetDisplacement(file, cursor, *instruction, mode, r_m);
+                
 
                 // get (formatted) source and dest
                 if mode == {
-                    case 0b00; #through;    // Memory Mode - no displacement* (still must read 1 byte if R/M = 110)
+                    case 0b00; #through;    // Memory Mode - no displacement* (unless R/M = 110)
                     case 0b01; #through;    // Memory mode - 8 bit displacement
                     case 0b10; {            // Memory mode - 16 bit displacement
+                        // get displacement if one exists
+                        displacement := ReadDisplacementBytesAndGetDisplacement(file, cursor, *instruction, mode, r_m);
+
                         effective_address := GetEffectiveAddressString(mode, r_m, displacement);
+                        
                         dest = ifx dest_flag then REGISTER_NAME[word_reg] else effective_address;
                         source = ifx dest_flag then effective_address else REGISTER_NAME[word_reg];
                     }
@@ -221,22 +270,21 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
             if (buffer[0] >> 1 == 0b1010000 || // Memory to accumulator
                 buffer[0] >> 1 == 0b1010001) { // Accumulator to memory
 
-                is_mem_to_acc := (buffer[0] >> 1 == 0b1010000);
-
                 WORD_MASK :: 0b00000001;
                 word_flag := buffer[0] & WORD_MASK;
 
                 ReadBytesIntoInstructionBuffer(file, cursor, *instruction, xx ifx word_flag then 2 else 1);
 
                 acc_name := ifx word_flag then "ax" else "al";
-                memory_addr : u16 = 0;
+                
+                memory_addr : u16 = ---;
                 if word_flag {
                     memory_addr = (cast(*u16) *(buffer[1])).*;
                 } else {
                     memory_addr = buffer[1];
                 }
 
-                if is_mem_to_acc {
+                if buffer[0] >> 1 == 0b1010000 { // mem to acc
                     append(*full_asm, "; MOV (Memory to accumulator)\n");
                     append(*asm, sprint("mov %, [%]\n", acc_name, memory_addr));
                 } else {
