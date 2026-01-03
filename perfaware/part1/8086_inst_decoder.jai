@@ -2,6 +2,7 @@
 #import "Basic";
 #import "File";
 #import "String";
+#import "Math";
 
 NUM_REGISTERS :: 16;
 REGISTER_NAME : [NUM_REGISTERS] string : #run BuildRegisterNames();
@@ -46,6 +47,57 @@ BuildEffectiveAddresses :: () -> [NUM_EFFECTIVE_ADDRESSES] string {
     effective_addresses[0b110] = "bp";
     effective_addresses[0b111] = "bx";
     return effective_addresses;
+}
+
+/*
+GetNumDisplacementBytesToRead :: (mode : u8, r_m : u8) -> u8 {
+    num : u8;
+    if mode == {
+        case 0b00; num = xx ifx r_m == 0b110 then 2 else 0;
+        case 0b01; num = 1;
+        case 0b10; num = 2;
+        case 0b11; num = 0;
+    }
+    return num;
+}
+*/
+
+ReadDisplacementBytesAndGetDisplacement :: (file : string, cursor : *int, instruction : *InstructionBuffer, mode : u8, r_m : u8) -> s16 {
+    num_displacement_bytes : u8 = 0;
+    if mode == {
+        case 0b00; num_displacement_bytes = xx ifx r_m == 0b110 then 2 else 0;
+        case 0b01; num_displacement_bytes = 1;
+        case 0b10; num_displacement_bytes = 2;
+        case 0b11; num_displacement_bytes = 0;
+    }
+
+    if num_displacement_bytes == 0 return 0;    // early terminate
+    
+    displacement : s16 = 0;
+    ReadBytesIntoInstructionBuffer(file, cursor, instruction, num_displacement_bytes);
+
+    using instruction.*;
+    if num_displacement_bytes == {
+        case 1; displacement = (cast(*s8) *(buffer[2])).*;
+        case 2; displacement = (cast(*s16) *(buffer[2])).*;
+    }
+    return displacement;
+}
+
+GetEffectiveAddressString :: (mode : u8, r_m : u8, displacement : s16 = 0) -> string {
+    assert(mode != 0b11); // shouldnt use this function if in register mode
+
+    if (mode == 0b00 && r_m == 0b110) return sprint("[%]", displacement);   // direct address
+
+    effective_address : String_Builder;
+    init_string_builder(*effective_address);
+
+    append(*effective_address, "[");
+    append(*effective_address, EFFECTIVE_ADDRESS[r_m]);
+    if displacement != 0
+        append(*effective_address, sprint(" % %", ifx displacement > 0 "+" else "-", abs(displacement)));
+    append(*effective_address, "]");
+    return builder_to_string(*effective_address);
 }
 
 MAX_INSTRUCTION_BYTES :: 6;
@@ -113,6 +165,7 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
 
     // determine what opcode we are doing and whether we need to read more bytes
     // the first 4 bits give us a clue if we need to read more
+
     if buffer[0] >> 4 == { // high nibble
 
         case 0b1000; {
@@ -139,39 +192,15 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
 
                 dest, source : string; // ultimately we need to figure these out
 
-                // helper function -> "[base (+ displacement)]"
-                FormatEffectiveAddress :: (base : string, displacement : u16 = 0) -> string {
-                    return sprint("[%]", ifx displacement != 0 then sprint("% + %", base, displacement) else base);
-                }
+                // get displacement if one exists
+                displacement := ReadDisplacementBytesAndGetDisplacement(file, cursor, *instruction, mode, r_m);
 
-                // read any more displacement bytes we might need to
                 // get (formatted) source and dest
                 if mode == {
-                    case 0b00; { // Memory Mode - no displacement* (still must read 1 byte if R/M = 110)
-                        base_effective_address : string;
-                        if r_m == 0b110 {
-                            ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 2);
-                            base_effective_address = sprint("%", cast(u8) buffer[2]); // not sure how to directly cast u16 to string. too tired to figure it out
-                        } else {
-                            base_effective_address = EFFECTIVE_ADDRESS[r_m];
-                        }
-
-                        dest = ifx dest_flag then REGISTER_NAME[word_reg] else FormatEffectiveAddress(base_effective_address);
-                        source = ifx dest_flag then FormatEffectiveAddress(base_effective_address) else REGISTER_NAME[word_reg];
-                    }
-                    case 0b01; { // Memory mode - 8 bit displacement
-                        ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 1);
-
-                        effective_address := FormatEffectiveAddress(EFFECTIVE_ADDRESS[r_m], buffer[2]);
-
-                        dest = ifx dest_flag then REGISTER_NAME[word_reg] else effective_address;
-                        source = ifx dest_flag then effective_address else REGISTER_NAME[word_reg];
-                    }
-                    case 0b10; { // Memory mode - 16 bit displacement
-                        ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 2);
-
-                        effective_address := FormatEffectiveAddress(EFFECTIVE_ADDRESS[r_m], (cast(*u16) *(buffer[2])).*);
-
+                    case 0b00; #through;    // Memory Mode - no displacement* (still must read 1 byte if R/M = 110)
+                    case 0b01; #through;    // Memory mode - 8 bit displacement
+                    case 0b10; {            // Memory mode - 16 bit displacement
+                        effective_address := GetEffectiveAddressString(mode, r_m, displacement);
                         dest = ifx dest_flag then REGISTER_NAME[word_reg] else effective_address;
                         source = ifx dest_flag then effective_address else REGISTER_NAME[word_reg];
                     }
@@ -183,6 +212,37 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
                 }
 
                 append(*asm, sprint("mov %, %\n", dest, source));
+                printed_to_asm = true;
+            }
+        }
+
+        case 0b1010; {
+            // These two are so similar we're just going to handle them together:
+            if (buffer[0] >> 1 == 0b1010000 || // Memory to accumulator
+                buffer[0] >> 1 == 0b1010001) { // Accumulator to memory
+
+                is_mem_to_acc := (buffer[0] >> 1 == 0b1010000);
+
+                WORD_MASK :: 0b00000001;
+                word_flag := buffer[0] & WORD_MASK;
+
+                ReadBytesIntoInstructionBuffer(file, cursor, *instruction, xx ifx word_flag then 2 else 1);
+
+                acc_name := ifx word_flag then "ax" else "al";
+                memory_addr : u16 = 0;
+                if word_flag {
+                    memory_addr = (cast(*u16) *(buffer[1])).*;
+                } else {
+                    memory_addr = buffer[1];
+                }
+
+                if is_mem_to_acc {
+                    append(*full_asm, "; MOV (Memory to accumulator)\n");
+                    append(*asm, sprint("mov %, [%]\n", acc_name, memory_addr));
+                } else {
+                    append(*full_asm, "; MOV (Accumulator to memory)\n");
+                    append(*asm, sprint("mov [%], %\n", memory_addr, acc_name));
+                }
                 printed_to_asm = true;
             }
         }
@@ -203,6 +263,34 @@ ReadInstruction :: (file : string, cursor : *int, print_instruction_buffer : boo
                 (cast(*u16) *(buffer[1])).*)
             );
             printed_to_asm = true;
+        }
+
+        case 0b1100; {
+            if buffer[0] >> 1 == 0b1100011 {
+                WORD_MASK :: 0b00000001;
+                word_flag := buffer[0] & WORD_MASK;
+
+                append(*full_asm, sprint("; MOV (immediate to R/M - %)\n", ifx word_flag then "16 bits" else "8 bits"));
+
+                ReadBytesIntoInstructionBuffer(file, cursor, *instruction, 1);
+
+                MODE_MASK   :: 0b11000000;
+                R_M_MASK    :: 0b00000111;
+
+                mode := (buffer[1] & MODE_MASK) >> 6;
+                r_m := buffer[1] & R_M_MASK;
+
+                displacement := ReadDisplacementBytesAndGetDisplacement(file, cursor, *instruction, mode, r_m);
+                // can we assume it will be effective address and not register? I think so
+                effective_address := GetEffectiveAddressString(mode, r_m, displacement);
+                
+                data_start_byte := num_bytes;
+                ReadBytesIntoInstructionBuffer(file, cursor, *instruction, xx ifx word_flag then 2 else 1);
+                data : u16 = ifx word_flag then (cast(*u16) *(buffer[data_start_byte])).* else buffer[data_start_byte];
+
+                append(*asm, sprint("mov %, % %\n", effective_address, ifx word_flag then "word" else "byte", data));
+                printed_to_asm = true;
+            }
         }
 
     }
